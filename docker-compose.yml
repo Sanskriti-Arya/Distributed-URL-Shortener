@@ -1,0 +1,71 @@
+x-api-env: &api-env
+  DATABASE_URL: postgresql://shortener:shortener@postgres:5432/shortener
+  CACHE_REDIS_URL: redis://redis-cache:6379/0
+  QUEUE_REDIS_URL: redis://redis-queue:6379/0
+  BASE_URL: http://localhost:8000
+  RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-60}
+
+x-api: &api
+  build: .
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis-cache: { condition: service_started }
+    redis-queue: { condition: service_started }
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports: ["8000:80"]
+    volumes: ["./nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [api1, api2, api3]
+
+  api1:
+    <<: *api
+    environment: { <<: *api-env, INSTANCE_ID: api-1 }
+  api2:
+    <<: *api
+    environment: { <<: *api-env, INSTANCE_ID: api-2 }
+  api3:
+    <<: *api
+    environment: { <<: *api-env, INSTANCE_ID: api-3 }
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment: *api-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis-queue: { condition: service_started }
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: shortener
+      POSTGRES_DB: shortener
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortener"]
+      interval: 3s
+      retries: 20
+
+  # Cache: losing it is fine, evicting from it is its job.
+  redis-cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    ports: ["6379:6379"]
+
+  # Queue: must never evict unread events, and should survive restarts.
+  redis-queue:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    ports: ["6380:6379"]
+    volumes: ["queuedata:/data"]
+
+volumes:
+  pgdata:
+  queuedata:
